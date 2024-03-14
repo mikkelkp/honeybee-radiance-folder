@@ -13,6 +13,7 @@ import warnings
 import os
 import re
 import shutil
+import itertools
 
 import honeybee_radiance_folder.config as config
 
@@ -438,7 +439,7 @@ class ModelFolder(_Folder):
         )
         return self._match_files(modifier_files, geometry_files)
 
-    def aperture_group_files_black(self, exclude=None, rel_path=False):
+    def aperture_group_files_black(self, exclude=None, rel_path=False, interior=False):
         """Return list of files for black aperture groups.
 
         Args:
@@ -447,19 +448,20 @@ class ModelFolder(_Folder):
                 identifier or a list of aperture group identifiers.
             rel_path: Set rel_path to True for getting full path to files. By
                 default the path is relative to study folder root.
+            interior: Set to True to get the black file for interior aperture groups.
         """
         if exclude and not isinstance(exclude, (list, tuple)):
             exclude = [exclude]
         else:
             exclude = []
         
-        states = self.aperture_groups_states(full=True)
+        states = self.aperture_groups_states(full=True, interior=interior)
         blk_files = []
         for aperture_group, ap_states in states.items():
             if aperture_group in exclude:
                 continue
             blk_file = os.path.normpath(ap_states[0]['black'])
-            blk_file = os.path.join(self.aperture_group_folder(full=rel_path), blk_file)
+            blk_file = os.path.join(self.aperture_group_folder(full=rel_path, interior=interior), blk_file)
             blk_files.append(self._as_posix(blk_file))
 
         return blk_files
@@ -778,6 +780,144 @@ class ModelFolder(_Folder):
 
         return scene_mapping
 
+    def scene_mapping(self, exclude_static=True, phase=2, default_states=False):
+        """List of rad files for each state of aperture groups. These files can be used
+        to create the octree for each specific state for dynamic daylight simulations.
+
+        Arg:
+            exclude_static: A boolean to note whether static apertures are included. If
+                True static apertures will be treated as a state, and a list of scene
+                files for static apertures will be created.
+            phase: An integer to note which multiphase study to generate the list of
+                grids for. Chose between 2, 3, and 5.
+            default_states: A boolean to note whether to get the rad files for only
+                default states or all states of the aperture groups.
+        """
+
+        # check if phase is valid
+        if phase not in [2, 3, 5]:
+            raise ValueError(
+                '%s is not a valid phase. Must be 2, 3 or 5.' % phase
+            )
+        two_phase, three_phase, five_phase = [], [], []
+
+        # two phase static apertures
+        if not exclude_static:
+            scene_files = self.scene_files()
+            scene_files_direct = self.scene_files(black_out=True)
+            if self.has_aperture:
+                scene_files += self.aperture_files()
+                scene_files_direct += self.aperture_files()
+            if self.has_aperture_group:
+                # add black aperture groups if any
+                scene_files += self.aperture_group_files_black()
+                scene_files += self.aperture_group_files_black(interior=True)
+                scene_files_direct += self.aperture_group_files_black()
+                scene_files_direct += self.aperture_group_files_black(interior=True)
+
+            two_phase.append(
+                {
+                    'light_path': '__static_apertures__',
+                    'identifier': 'default',
+                    'scene_files': scene_files,
+                    'scene_files_direct': scene_files_direct
+                }
+            )
+
+        if self.has_aperture_group:
+            states = self.aperture_groups_states(full=True)
+            states.update(self.aperture_groups_states(full=True, interior=True))
+
+            grids_info = self.grid_info()
+            for grid_info in grids_info:
+                light_paths = grid_info.get('light_path', [])
+                for light_path in light_paths:
+                    light_path_prod = []
+                    for lp_id in light_path:
+                        if lp_id == '__static_apertures__':
+                            continue
+                        light_path_prod.append(states[lp_id])
+                    print('---------')
+                    print(list(itertools.product(*light_path_prod)))
+            #assert False, None
+            # add scene files for each state. Static apertures and all other aperture
+            # groups will be black
+            for aperture_group, ap_states in states.items():
+                if default_states:
+                    # select only the first state
+                    ap_states = [ap_states[0]]
+                for state in ap_states:
+                    if not 'tmtx' in state or ('tmtx' in state and phase == 2):
+                        pattern = '%s$' % state['default'].replace('./', '')
+
+                        scene_files = self.scene_files() + \
+                            self.aperture_files(black_out=True) + \
+                            self._find_files(
+                                self.aperture_group_folder(full=True), pattern) + \
+                            self.aperture_group_files_black(exclude=aperture_group)
+                        # scene_files_direct = self.scene_files(black_out=True) + \
+                        #     self.aperture_files(black_out=True) + \
+                        #     self._find_files(
+                        #         self.aperture_group_folder(full=True), pattern) + \
+                        #     self.aperture_group_files_black(exclude=aperture_group)
+
+                        two_phase.append(
+                            {
+                                'light_path': aperture_group,
+                                'identifier': state['identifier'],
+                                'scene_files': scene_files,
+                                #'scene_files_direct': scene_files_direct
+                            }
+                        )
+                    else:
+                        # five phase
+                        pattern = '%s$' % state['direct'].replace('./', '')
+                        five_phase.append(
+                            {
+                            'light_path': aperture_group,
+                            'identifier': state['identifier'],
+                            'scene_files_direct': self.scene_files(black_out=True) + \
+                                self.aperture_files(black_out=True) + \
+                                self._find_files(self.aperture_group_folder(full=True),
+                                    pattern) + \
+                                self.aperture_group_files_black(exclude=aperture_group)
+                            }
+                        )
+
+            # three phase
+            three_phase.append(
+                {
+                'light_path': None,
+                'identifier': '__three_phase__',
+                'scene_files': self.scene_files() + self.aperture_files(),
+                'scene_files_direct': self.scene_files(black_out=True) + \
+                    self.aperture_files(black_out=True)
+                }
+            )
+
+        if phase == 2:
+            scene_mapping = {
+                'two_phase': two_phase
+            }
+        if phase == 3:
+            scene_mapping = {
+                'two_phase': two_phase,
+                'three_phase': three_phase
+            }
+        if phase == 5:
+            scene_mapping = {
+                'two_phase': two_phase,
+                'three_phase': three_phase,
+                'five_phase': five_phase
+            }
+
+        scene_mapping_file = os.path.join(self.folder, 'scene_mapping.json')
+
+        with open(scene_mapping_file, 'w') as outf:
+            outf.write(json.dumps(scene_mapping, indent=2))
+
+        return scene_mapping
+
     def grid_mapping(self, exclude_static=True, phase=2):
         """List of grids for each light path. The light paths are grouped as two phase,
         three phase, and five phase. Aperture groups with a tmtx key in their states will
@@ -805,6 +945,7 @@ class ModelFolder(_Folder):
         non_mtx_groups = []
         if self.has_aperture_group:
             states = self.aperture_groups_states(full=True)
+            states.update(self.aperture_groups_states(full=True, interior=True))
             # get list of mtx groups and non-mtx groups
             for aperture_group, ap_states in states.items():
                 for state in ap_states:
